@@ -1,0 +1,6 @@
+{
+  "name": "safe-doc-guard-mcp",
+  "description": "Production Model Context Protocol (MCP) security intermediary server and workbench for detecting indirect prompt injections, zero-width obfuscation, and SQL exfiltration payloads in PDF and text documents.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

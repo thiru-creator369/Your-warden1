@@ -1,0 +1,20 @@
+{
+  "mcpServers": {
+    "safe-doc-guard-mcp": {
+      "command": "uv",
+      "args": [
+        "run",
+        "--with", "fastapi>=0.115.0",
+        "--with", "uvicorn>=0.30.0",
+        "--with", "mcp[cli]>=1.0.0",
+        "--with", "pypdf>=5.0.0",
+        "--with", "pydantic>=2.10.0",
+        "fastmcp", "run",
+        "/ABSOLUTE/PATH/TO/safe-doc-guard-mcp/server.py"
+      ],
+      "env": {
+        "SAFE_DOC_GUARD_RISK_THRESHOLD": "0.35"
+      }
+    }
+  }
+}
