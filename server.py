@@ -1,7 +1,6 @@
 """
-safe-doc-guard-mcp (Self-Contained Standalone Production Server)
-Single-file Python server combining FastMCP tools, document extraction,
-heuristic regex pre-filtering, and quarantine store with ZERO external sibling imports.
+safe-doc-guard-mcp: Self-Contained Standalone Production Server
+Runs stdio MCP for Claude Desktop, FastAPI REST endpoints, Swagger UI, and /sse transport on Render.
 """
 
 import sys
@@ -11,18 +10,51 @@ import hashlib
 import io
 import re
 import uuid
+import json
+from pathlib import Path
 from typing import Optional, List, Dict, Any, Literal
 from pydantic import BaseModel, Field
-from mcp.server.fastmcp import FastMCP
+
+try:
+    from mcp.server.fastmcp import FastMCP
+except (ImportError, ModuleNotFoundError):
+    try:
+        from mcp.server.mcpserver import MCPServer as FastMCP
+    except ImportError:
+        try:
+            from fastmcp import FastMCP
+        except ImportError:
+            raise ImportError('FastMCP not found. Run: pip install "mcp[cli]<2.0.0"')
+
+from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
 from pypdf import PdfReader
 
-# 1. Initialize FastMCP Server
+# ---------------------------------------------------------------------------
+# 1. Initialize FastMCP Server & FastAPI App
+# ---------------------------------------------------------------------------
 mcp = FastMCP(
     name="safe-doc-guard-mcp",
-    dependencies=["pypdf", "pydantic", "mcp"]
+    dependencies=["pypdf", "pydantic", "mcp", "fastapi", "uvicorn"]
 )
 
+app = FastAPI(
+    title="safe-doc-guard-mcp API",
+    description="Python FastAPI & FastMCP intermediary guarding database-connected LLM agents.",
+    version="1.0.0"
+)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# ---------------------------------------------------------------------------
 # 2. Pydantic Models & Security Schemas
+# ---------------------------------------------------------------------------
 class SecurityVerdict(BaseModel):
     is_poisoned: bool = Field(description="True if indirect injection or exfiltration is detected")
     risk_score: float = Field(ge=0.0, le=1.0, description="Risk score from 0.0 to 1.0")
@@ -55,10 +87,35 @@ class QuarantinedRecord(BaseModel):
     override_decision: Optional[str] = None
     reviewer_note: Optional[str] = None
 
-# In-Memory Quarantine Store
+# File-backed shared quarantine store path
+QUARANTINE_FILE = Path(__file__).resolve().parent / "quarantine_store.json"
 QUARANTINE_STORE: Dict[str, QuarantinedRecord] = {}
 
-# 3. Heuristic Regex Pre-Filter
+def load_quarantine_store() -> Dict[str, QuarantinedRecord]:
+    global QUARANTINE_STORE
+    if QUARANTINE_FILE.exists():
+        try:
+            with open(QUARANTINE_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+                for k, v in data.items():
+                    QUARANTINE_STORE[k] = QuarantinedRecord.model_validate(v)
+        except Exception:
+            pass
+    return QUARANTINE_STORE
+
+def save_quarantine_store():
+    try:
+        data = {k: v.model_dump() for k, v in QUARANTINE_STORE.items()}
+        with open(QUARANTINE_FILE, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2)
+    except Exception:
+        pass
+
+load_quarantine_store()
+
+# ---------------------------------------------------------------------------
+# 3. Document Extraction & Heuristic Regexes
+# ---------------------------------------------------------------------------
 ZERO_WIDTH_REGEX = re.compile(r"[\u200B\u200C\u200D\uFEFF\u2060\u202A-\u202E]")
 ASCII_CONTROL_REGEX = re.compile(r"[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]")
 OVERRIDE_REGEX = re.compile(
@@ -77,111 +134,81 @@ def decode_base64_payload(data: str) -> bytes:
     cleaned = re.sub(r"\s+", "", cleaned)
     return base64.b64decode(cleaned)
 
-def extract_document(file_path: Optional[str], base64_data: Optional[str], mime_type: str):
-    if base64_data:
-        raw_bytes = decode_base64_payload(base64_data)
-        source_name = "inline_base64_document"
-    elif file_path:
-        with open(file_path, "rb") as f:
-            raw_bytes = f.read()
-        source_name = file_path
-    else:
-        raise ValueError("Either file_path or base64_data must be provided.")
-
-    sha256 = f"sha256:{hashlib.sha256(raw_bytes).hexdigest()}"
-
-    if mime_type == "application/pdf" or raw_bytes.startswith(b"%PDF-"):
-        reader = PdfReader(io.BytesIO(raw_bytes))
-        visible_lines = []
-        annotations = []
-        for page in reader.pages:
-            t = page.extract_text() or ""
-            if t:
-                visible_lines.append(t)
-            if "/Annots" in page:
-                for annot_ref in page["/Annots"]:
-                    try:
-                        obj = annot_ref.get_object()
-                        if "/Contents" in obj:
-                            annotations.append(str(obj["/Contents"]))
-                    except Exception:
-                        pass
-        info = reader.metadata or {}
-        meta = DocumentMetadata(
-            source_name=source_name,
-            mime_type="application/pdf",
-            byte_length=len(raw_bytes),
-            page_count=len(reader.pages),
-            title=info.get("/Title") or source_name,
-            author=info.get("/Author") or "Unknown",
-            subject=info.get("/Subject"),
-            keywords=info.get("/Keywords"),
-            annotations=annotations,
-            sha256_fingerprint=sha256
-        )
-        visible_text = "\n".join(visible_lines)
-        combined = visible_text + "\n" + "\n".join(annotations)
-        return visible_text, annotations, meta, combined
-
-    text = raw_bytes.decode("utf-8", errors="replace")
-    meta = DocumentMetadata(
-        source_name=source_name,
-        mime_type=mime_type,
-        byte_length=len(raw_bytes),
-        page_count=1,
-        title=source_name,
-        author="Plaintext Stream",
-        annotations=[],
-        sha256_fingerprint=sha256
-    )
-    return text, [], meta, text
-
-# 4. MCP Tools
+# ---------------------------------------------------------------------------
+# 4. FastMCP Tools
+# ---------------------------------------------------------------------------
 @mcp.tool()
 def inspect_and_read_document(
     mime_type: Literal["application/pdf", "text/plain", "text/markdown", "text/csv"] = "application/pdf",
     file_path: Optional[str] = None,
     base64_data: Optional[str] = None
 ) -> Dict[str, Any]:
-    """Inspects document for prompt injections, zero-width chars, and SQL exfiltration payloads."""
+    """Inspects a document for prompt injection and SQL exfiltration before ingestion."""
+    if not file_path and not base64_data:
+        return {"error": "Provide either file_path or base64_data", "status": "ERROR"}
+
     try:
-        visible_text, annotations, meta, surface = extract_document(file_path, base64_data, mime_type)
+        if file_path:
+            p = Path(file_path)
+            if not p.is_file():
+                return {"error": f"File '{file_path}' not found.", "status": "ERROR"}
+            raw_bytes = p.read_bytes()
+            source_name = p.name
+        else:
+            raw_bytes = decode_base64_payload(base64_data or "")
+            source_name = "in_memory_payload"
+
+        fingerprint = hashlib.sha256(raw_bytes).hexdigest()
+        visible_text = ""
+        annotations = []
+        page_count = 1
+
+        if mime_type == "application/pdf" or raw_bytes.startswith(b"%PDF"):
+            reader = PdfReader(io.BytesIO(raw_bytes))
+            page_count = max(1, len(reader.pages))
+            for page in reader.pages:
+                text = page.extract_text() or ""
+                visible_text += text + "\n"
+                if "/Annots" in page:
+                    for ann in page["/Annots"]:
+                        obj = ann.get_object()
+                        if "/Contents" in obj:
+                            annotations.append(str(obj["/Contents"]))
+        else:
+            visible_text = raw_bytes.decode("utf-8", errors="replace")
+
+        meta = DocumentMetadata(
+            source_name=source_name,
+            mime_type=mime_type,
+            byte_length=len(raw_bytes),
+            page_count=page_count,
+            annotations=annotations,
+            sha256_fingerprint=fingerprint
+        )
+
         detected_patterns = []
         suspicious_excerpts = []
         risk_score = 0.0
 
-        clean_surface = ZERO_WIDTH_REGEX.sub("", surface)
+        if ZERO_WIDTH_REGEX.search(visible_text):
+            detected_patterns.append("STEGANOGRAPHY:ZERO_WIDTH_CHARS")
+            suspicious_excerpts.append("Zero-width hidden unicode characters detected")
+            risk_score += 0.85
 
-        zw_chars = ZERO_WIDTH_REGEX.findall(surface)
-        if zw_chars:
-            detected_patterns.append("ZERO_WIDTH_CHAR:STEGO_UNICODE")
-            risk_score += 0.4
-            suspicious_excerpts.append(f"Found {len(zw_chars)} zero-width characters")
-
-        if OVERRIDE_REGEX.search(clean_surface):
+        if OVERRIDE_REGEX.search(visible_text):
             detected_patterns.append("CLASSIC_OVERRIDE:IGNORE_INSTRUCTIONS")
-            risk_score += 0.5
-            suspicious_excerpts.append("Contains override directive ('ignore previous instructions')")
+            suspicious_excerpts.append("Instruction override phrasing detected")
+            risk_score += 0.95
 
-        if SYSTEM_TAGS_REGEX.search(clean_surface):
+        if SYSTEM_TAGS_REGEX.search(visible_text):
             detected_patterns.append("CLASSIC_OVERRIDE:SYSTEM_TAGS")
-            risk_score += 0.45
-            suspicious_excerpts.append("Contains boundary tags (<system>, [INST])")
+            suspicious_excerpts.append("Delimiters mimicking system role tags detected")
+            risk_score += 0.90
 
-        if SQL_EXFIL_REGEX.search(clean_surface):
-            detected_patterns.append("SQL_EXFILTRATION:DATABASE_QUERY")
-            risk_score += 0.6
-            suspicious_excerpts.append("Contains SQL query targeting credential tables")
-
-        for b64_cand in BASE64_BLOB_REGEX.findall(clean_surface):
-            try:
-                dec = base64.b64decode(b64_cand).decode("utf-8", errors="ignore")
-                if OVERRIDE_REGEX.search(dec) or SQL_EXFIL_REGEX.search(dec):
-                    detected_patterns.append("OBFUSCATED_BASE64:PAYLOAD")
-                    risk_score += 0.55
-                    suspicious_excerpts.append(f"Decoded Base64: {dec[:80]}")
-            except Exception:
-                pass
+        if SQL_EXFIL_REGEX.search(visible_text):
+            detected_patterns.append("EXFILTRATION:SQL_CREDENTIAL_QUERY")
+            suspicious_excerpts.append("SQL query targeting sensitive database tables detected")
+            risk_score += 0.95
 
         risk_score = min(1.0, round(risk_score, 2))
         is_poisoned = risk_score >= 0.35 or len(detected_patterns) > 0
@@ -218,6 +245,7 @@ def inspect_and_read_document(
             verdict=verdict,
             status="PENDING"
         )
+        save_quarantine_store()
 
         return {
             "status": "INTERVENTION_REQUIRED",
@@ -240,6 +268,7 @@ def approve_quarantined_content(
     reviewer_note: Optional[str] = None
 ) -> Dict[str, Any]:
     """Human-in-the-loop (HITL) resolution tool to approve or reject a quarantined document."""
+    load_quarantine_store()
     rec = QUARANTINE_STORE.get(review_token.strip())
     if not rec:
         return {"error": f"Review token '{review_token}' not found.", "status": "ERROR"}
@@ -252,6 +281,7 @@ def approve_quarantined_content(
     rec.resolved_at = time.time()
     rec.override_decision = override_decision
     rec.reviewer_note = reviewer_note
+    save_quarantine_store()
 
     if override_decision == "REJECT":
         return {
@@ -274,53 +304,9 @@ def approve_quarantined_content(
             "message": "WARNING: Raw document released via explicit human override."
         }
 
-# -----------------------------------------------------------------------------
-# MCP Remote SSE Transport (/sse & /messages for Claude Desktop)
-# -----------------------------------------------------------------------------
-from mcp.server.sse import SseServerTransport
-from starlette.requests import Request
-
-sse_transport = SseServerTransport("/messages")
-
-@app.api_route("/sse", methods=["GET", "POST"])
-async def handle_sse(request: Request):
-    """Establishes the live Server-Sent Events stream with Claude Desktop."""
-    async with sse_transport.connect_sse(
-        request.scope, request.receive, request._send
-    ) as (read_stream, write_stream):
-        init_options = mcp._mcp_server.create_initialization_options()
-        await mcp._mcp_server.run(read_stream, write_stream, init_options)
-
-@app.api_route("/messages", methods=["GET", "POST"])
-async def handle_messages(request: Request):
-    """Receives JSON-RPC messages from Claude and routes them to MCP tools."""
-    await sse_transport.handle_post_message(
-        request.scope, request.receive, request._send
-    )
-
-
-if __name__ == "__main__":
-    mcp.run()
 # ---------------------------------------------------------------------------
-# FastAPI ASGI Application & Swagger UI
+# 5. FastAPI REST & Swagger Endpoints
 # ---------------------------------------------------------------------------
-from fastapi import FastAPI
-from fastapi.middleware.cors import CORSMiddleware
-
-app = FastAPI(
-    title="safe-doc-guard-mcp Dashboard & API",
-    description="Intermediary guarding database-connected LLM agents against indirect prompt injection.",
-    version="1.0.0"
-)
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
 @app.api_route("/", methods=["GET", "HEAD"])
 def root():
     return {
@@ -328,7 +314,8 @@ def root():
         "service": "safe-doc-guard-mcp",
         "docs": "/docs",
         "health": "/health",
-        "message": "Safe Doc Guard MCP server is online!"
+        "sse": "/sse",
+        "message": "Safe Doc Guard MCP server is running!"
     }
 
 @app.api_route("/health", methods=["GET", "HEAD"])
@@ -336,25 +323,55 @@ def health_check():
     return {
         "status": "ok",
         "service": "safe-doc-guard-mcp",
-        "quarantine_count": len(QUARANTINE_STORE)
+        "quarantine_pending": sum(1 for r in QUARANTINE_STORE.values() if r.status == "PENDING"),
+        "total_quarantined": len(QUARANTINE_STORE)
     }
 
 @app.post("/api/inspect-and-read")
-def api_inspect(payload: dict):
+def api_inspect_and_read(payload: Dict[str, Any]):
     return inspect_and_read_document(
         mime_type=payload.get("mime_type", "application/pdf"),
         file_path=payload.get("file_path"),
-        base64_data=payload.get("base64_data")
+        base64_data=payload.get("base64_data"),
     )
 
 @app.post("/api/approve-quarantined")
-def api_approve(payload: dict):
+def api_approve_quarantined(payload: Dict[str, Any]):
     return approve_quarantined_content(
         review_token=payload.get("review_token", ""),
         override_decision=payload.get("override_decision", "ALLOW_SANITIZED"),
-        reviewer_note=payload.get("reviewer_note")
+        reviewer_note=payload.get("reviewer_note"),
     )
 
 @app.get("/api/quarantine-records")
-def api_records():
+def api_get_quarantine_records():
+    load_quarantine_store()
     return {"records": [r.model_dump() for r in QUARANTINE_STORE.values()]}
+
+# ---------------------------------------------------------------------------
+# 6. MCP Remote SSE Transport (/sse & /messages for Claude Desktop)
+# ---------------------------------------------------------------------------
+try:
+    from mcp.server.sse import SseServerTransport
+    from starlette.requests import Request
+
+    sse_transport = SseServerTransport("/messages")
+
+    @app.api_route("/sse", methods=["GET", "POST"])
+    async def handle_sse(request: Request):
+        async with sse_transport.connect_sse(
+            request.scope, request.receive, request._send
+        ) as (read_stream, write_stream):
+            init_options = mcp._mcp_server.create_initialization_options()
+            await mcp._mcp_server.run(read_stream, write_stream, init_options)
+
+    @app.api_route("/messages", methods=["GET", "POST"])
+    async def handle_messages(request: Request):
+        await sse_transport.handle_post_message(
+            request.scope, request.receive, request._send
+        )
+except Exception as exc:
+    print(f"Warning: SseServerTransport error: {exc}", file=sys.stderr)
+
+if __name__ == "__main__":
+    mcp.run()
