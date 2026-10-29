@@ -296,6 +296,18 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+@app.get("/")
+def root():
+    return {
+        "status": "online",
+        "service": "your-warden1",
+        "docs_url": "/docs",
+        "health_url": "/health",
+        "message": "Safe Doc Guard server is live! Open /docs to view the interactive dashboard."
+    }
+
+
+
 @app.get("/health")
 def health():
     return {"status": "ok", "service": "safe-doc-guard-mcp", "quarantine_count": len(QUARANTINE_STORE)}
