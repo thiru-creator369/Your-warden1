@@ -274,6 +274,31 @@ def approve_quarantined_content(
             "message": "WARNING: Raw document released via explicit human override."
         }
 
+# -----------------------------------------------------------------------------
+# MCP Remote SSE Transport (/sse & /messages for Claude Desktop)
+# -----------------------------------------------------------------------------
+from mcp.server.sse import SseServerTransport
+from starlette.requests import Request
+
+sse_transport = SseServerTransport("/messages")
+
+@app.api_route("/sse", methods=["GET", "POST"])
+async def handle_sse(request: Request):
+    """Establishes the live Server-Sent Events stream with Claude Desktop."""
+    async with sse_transport.connect_sse(
+        request.scope, request.receive, request._send
+    ) as (read_stream, write_stream):
+        init_options = mcp._mcp_server.create_initialization_options()
+        await mcp._mcp_server.run(read_stream, write_stream, init_options)
+
+@app.api_route("/messages", methods=["GET", "POST"])
+async def handle_messages(request: Request):
+    """Receives JSON-RPC messages from Claude and routes them to MCP tools."""
+    await sse_transport.handle_post_message(
+        request.scope, request.receive, request._send
+    )
+
+
 if __name__ == "__main__":
     mcp.run()
 # ---------------------------------------------------------------------------
