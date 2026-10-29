@@ -296,21 +296,23 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-@app.get("/")
+@app.api_route("/", methods=["GET", "HEAD"])
 def root():
     return {
         "status": "online",
-        "service": "your-warden1",
-        "docs_url": "/docs",
-        "health_url": "/health",
-        "message": "Safe Doc Guard server is live! Open /docs to view the interactive dashboard."
+        "service": "safe-doc-guard-mcp",
+        "docs": "/docs",
+        "health": "/health",
+        "message": "Safe Doc Guard MCP server is online!"
     }
 
-
-
-@app.get("/health")
-def health():
-    return {"status": "ok", "service": "safe-doc-guard-mcp", "quarantine_count": len(QUARANTINE_STORE)}
+@app.api_route("/health", methods=["GET", "HEAD"])
+def health_check():
+    return {
+        "status": "ok",
+        "service": "safe-doc-guard-mcp",
+        "quarantine_count": len(QUARANTINE_STORE)
+    }
 
 @app.post("/api/inspect-and-read")
 def api_inspect(payload: dict):
